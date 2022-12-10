@@ -760,7 +760,7 @@ var WEBGL_FILTERS = {
 var WEBGL_WRAPPINGS = {
     33071: THREE.ClampToEdgeWrapping,
     33648: THREE.MirroredRepeatWrapping,
-    10497: THREE.REapeatWrapping
+    10497: THREE.ReapeatWrapping
 };
 
 var WEBGL_TYPES_SIZES = {
@@ -859,4 +859,461 @@ function assignExtrasToUserData(object, gltfDef) {
     }
 }
 
-// line 1268 continua
+function addMorphTargets(geometry, targets, parser){
+    var hasMorphPosition = false;
+    var hasMorphNormal = false;
+
+    for(var i = 0, il = targets.length; i < il; i++){
+        var target = targets[i];
+
+        if(target.POSITION !== undefined) hasMorphPosition = true;
+
+        if(target.NORMAL !== undefined) hasMorphNormal = true;
+
+        if(!hasMorphPosition && !hasMorphNormal) return Promise.resolve(geometry);
+
+        var pendingPositionAccessors = [];
+        var pendingNormalAccessors = [];
+
+        for(var i = 0, il = targets.length; i < il; i++){
+            var target = targets[i];
+
+            if(hasMorphPosition){
+                var pendingAccessor = target.POSITION !== undefined ? parser.getDependency('accessor', target.POSITION) : geometry.attributes.position;
+
+                pendingPositionAccessors.push(pendingAccessor);
+            }
+
+            if(hasMorphNormal){
+                var pendingAccessor = target.NORMAL !== undefined ? parser.getDependency('accessor', target.NORMAL) : geometry.attributes.normal;
+
+                pendingNormalAccessors.push(pendingAccessor);
+            }
+        }
+
+        return Promise.all([
+            Promise.all(pendingPositionAccessors),
+            Promise.all(pendingNormalAccessors)
+        ]).then(function(accessors){
+            var morphPositions = accessors[0];
+            var morphNormal = accessors[1];
+
+            if(hasMorphPosition) geometry.morphAttributes.position = morphPositions;
+
+            if(hasMorphNormal) geometry.morphAttributes.normal = morphNormals;
+
+            geometry.morphTargetsRelative = true;
+
+            return geometry;
+        });
+    }
+
+    function updateMorphTargets(mesh, meshDef) {
+        mesh.updateMorphTargets();
+
+        if(meshDef.weights !== undefined){
+            for(var i = 0, il = meshDef.weights.length; i < il; i++){
+                mesh.morphTargetInfluences[i] = meshDef.weights[i];
+            }
+        }
+
+        if(meshDef.extras && Array.isArray(meshDef.extras.targetNames)){
+            var targetNames = meshDef.extras.targetNames
+
+            if(mesh.morphTargetInfluences.length === targetNames.length){
+                mesh.morphTargetDictionary = {};
+
+                for(var i = 0, il = targetNames.length; i < il; i++){
+                    mesh.morphTargetDictionary[targetNames[i]] = i;
+                }
+            }else{
+                console.warn('THREE.GLTFLoader: Invalid extras.targatNames length. Ignoring names.');
+            }
+        }
+    }
+
+    function createPrimitiveKey(primitiveDef){
+        var dracoExtension = primitiveDef.extensions && primitiveDef.extensions[EXTENSIONS.KHR_DRACO_MESH_COMPRESSION];
+        var geometryKey;
+
+        if(dracoExtension){
+            geometryKey = 'draco:' + dracoExtension.bufferView + ':' + dracoExtension.indices + ':' + createAttributesKey(dracoExtension.attributes);
+        }else{
+            geometryKey = primitiveDef.indices + ':' + createAttributesKey(primitiveDef.attributes) + ':' + primitiveDef.mode;
+        }
+
+        return geometryKey;
+    }
+
+    function createAttributsKey(attributes) {
+        var attributesKey = '';
+        var keys = Object.keys(attributes).sort();
+
+        for(var i = 0, il = keys.length; i < il; i++){
+            attributesKey += keys[i] + ':' + attributes[keys[i]] + ';';
+        }
+
+        return attributesKey;
+    }
+
+    function GLTFParser(json, extensions, options){
+        this.json = json || {};
+        this.extensions = extensions || {};
+        this.options = options || {};
+        this.cache = new GLTFRegistry();
+        this.primitiveCache = {};
+        this.textureLoader = new THREE.TextureLoader(this.options.manager);
+        this.textureLoader.setCrossOrigin(this.options.crossOrigin);
+        this.fileLoader = new THREE.FileLoader(this.options.manager);
+        this.fileLoader.setResponseType('arraybuffer');
+
+        if(this.options.crossOrigin === 'use-credentials'){
+            this.fileLoader.setWithCredentials(true);
+        }
+    }
+
+    GLTFParser.prototype.parse = function(onLoad, onError){
+        var parser = this;
+        var json = this.json;
+        var extensions = this.extensions;
+
+        this.cache.removeAll();
+        this.markDefs();
+
+        Promise.all([
+            this.getDependencies('scene'),
+            this.getDependencies('animation'),
+            this.getDependencies('camera')
+        ]).then(function(dependencies){
+            var result = {
+                scene: dependencies[0][json.scene || 0],
+                scenes: dependencies[0],
+                animations: dependencies[1],
+                cameras: dependencies[2],
+                asset: json.asset,
+                parser: parser,
+                userData: {}
+            };
+
+            addUnknownExtendionsToUserData(extensions, result, json);
+            assignExtrasToUserData(result, json);
+            onLoad(result);
+        }).catch(onError);
+    };
+
+    GLTFParser.prototype.markDefs = function(){
+        var nodeDefs = this.json.nodes || [];
+        var skinDefs = this.json.skins || [];
+        var meshDefs = this.json.meshes || [];
+
+        var meshReferences = {};
+        var meshUses = {};
+
+        for(var skinIndex = 0, skinLength = skinDefs.length; skinIndex < skinLength; skinIndex++){
+            var joints = skinDefs[skinIndex].joints;
+
+            for(var i = 0, il = joints.length; i < il; i++){
+                nodeDefs[joints[i]].isBone = true;
+            }
+        }
+
+        for(var nodeIndex = 0, nodeLength = nodeDefs.length; nodeIndex < nodeLength; nodeIndex++){
+            var nodeDef = nodeDefs[nodeIndex];
+
+            if(nodeDef.mesh !== undefined){
+                if(meshReferences[nodeDef.mesh] === undefined){
+                    meshReferences[nodeDef.mesh] = meshUses[nodeDef.mesh] = 0;
+                }
+
+                meshReferences[nodeDef.mesh]++;
+
+                if(nodeDef.skin !== undefined){
+                    meshDefs[nodeDef.mesh].isSkinnedMesh = true;
+                }
+            }
+        }
+
+        this.json.meshReferences = meshReferences;
+        this.json.meshUses = meshUses;
+    };
+    
+    GLTFParse.prototype.getDependency = function(type, index){
+        var cacheKey = type + ':' + index;
+        var dependency = this.cache.get(cacheKey);
+
+        if(!dependency){
+            switch (type) {
+                case 'scene':
+                    dependency = this.loadScene(index); 
+                    break;
+                case 'node':
+                    dependency = this.loadNode(index); 
+                    break;
+                case 'mesh':
+                    dependency = this.loadMesh(index); 
+                    break;
+                case 'accessor':
+                    dependency = this.loadAccessor(index); 
+                    break;
+                case 'bufferView':
+                    dependency = this.loadBufferView(index); 
+                    break;
+                case 'buffer':
+                    dependency = this.loadBuffer(index); 
+                    break;
+                case 'material':
+                    dependency = this.loadMaterial(index); 
+                    break;
+                case 'texture':
+                    dependency = this.loadTexture(index); 
+                    break;
+                case 'skin':
+                    dependency = this.loadSkin(index); 
+                    break;
+                case 'animation':
+                    dependency = this.loadAnimation(index); 
+                    break;
+                case 'camera':
+                    dependency = this.loadCamera(index); 
+                    break;
+                case 'light':
+                    dependency = this.extensions[EXTENSIONS.KHR_LIGTHS_PUNCTUAL].loadLight(index); 
+                    break;
+                default:
+                    throw new Error('Unknown type: ' + type);
+            }
+
+            this.cache.add(cacheKey, dependency);
+        }
+
+        return dependency;
+    }
+
+    GLTFParser.prototype.getDependencies = function(type){
+        var dependencies = this.cache.get(type);
+
+        if(!dependencies){
+            var parser = this;
+            var defs = this.json[type + (type === 'mesh' ? 'es' : 's')] || [];
+            
+            dependencies = Promise.all(defs.map(function(def, index){
+                return parser.getDependency(type, index);
+            }));
+
+            this.cache.add(type, dependencies);
+        };
+
+        GLTFParser.prototype.loadBuffer = function(bufferIndex){
+            var bufferDef = this.json.buffers[bufferIndex];
+            var loader = this.fileLoader;
+
+            if(bufferDef.type && bufferDef.type !== 'arraybuffer'){
+                throw new Error('THREE.GLTFLoader: ' + bufferDef.type + ' buffer type is not supportd.');
+            }
+
+            if(bufferDef.uri === undefined && bufferIndex === 0){
+                return Promise.resolve(this.extensions[EXTENSIONS.KHR_BINARY_GLTF].body);
+            }
+
+            var options = this.options;
+
+            return new Promise(function(resolve, reject){
+                loader.load(resolveURL(bufferDef.uri, options.path), resolve, undefined, function(){
+                    reject(new Error('THREE.GLTFLoader: Failed to load buffer "' + bufferDef.uri + '".'));
+                });
+            });
+        };
+
+        GLTFParser.prototype.loadBufferView = function(bufferViewIndex){
+            var bufferViewDef = this.json.bufferViews[bufferViewIndex];
+
+            return this.getDependency('buffer', bufferViewDef.buffer).then(function(buffer){
+                var byteLength = bufferViewDef.byteLength || 0;
+                var byteOffset = bufferViewDef.byteOffset || 0;
+
+                return buffer.slice(byteOffset, byteOffset + byteLength);
+            });
+        };
+
+        GLTFParser.prototype.loadAccessor =  function(accessorIndex){
+            var parser = this;
+            var json = this.json;
+            var accessorDef = this.json.accessors[accessorIndex];
+
+            if(accessorDef.bufferView === undefined && accessorDef.sparse === undefined){
+                return Promise.resolve(null);
+            }
+
+            var pendingBufferViews = [];
+
+            if(accessorDef.bufferView !== undefined){
+                pendingBufferViews.push(this.getDependency('bufferView', accessorDef.bufferView));
+            }else{
+                pendingBufferViews.push(null);
+            }
+
+            if(accessorDef.sparse !== undefined){
+                pendingBufferViews.push(this.getDependency('bufferView', accessorDef.sparse.indices.bufferView));
+                pendingBufferViews.push(this.getDependency('bufferView', accessorDef.sparse.values.bufferView));                
+            }
+
+            return Promise.all(pendingBufferViews).then(function(bufferViews){
+                var bufferView = bufferViews[0];
+                var itemSize = WEBGL_TYPES_SIZES[accessorDef.type];
+                var typeArray = WEBGL_COMPONENT_TYPES[accessorDef.componetType];
+                var elementBytes = TypedArray.BYTES_PER_ELEMENT;
+                var itemBytes = elementBytes * itemSize;
+                var byteOffset = accessorDef.byteOffset || 0;
+                var byteStride = accessorDef.bufferView !== undefined ? json.bufferViews[accessorDef.bufferDef.bufferView].byteStride : undefined;
+                var normalized = accessorDef.normalized === true;
+                var array, bufferAttribute;
+
+                if(byteStride && byteStride !== itemBytes){
+                    var ibSlice = Math.floor(byteOffset / byteStride);
+                    var ibCacheKey = 'InterleavedBuffer:' + accessorDef.bufferView + ':' + accessorDef.componetType + ':' + ibSlice + ':' + accessorDef.count;
+                    var ib = parser.cache.get(ibCacheKey);
+
+                    if(!ib){
+                        array = new TypedArray(bufferView, ibSlice * byteStride, accessorDef.count * byteStride / elementBytes);
+                        ib = new THREE.InterleavedBuffer(array, byteStride / elementBytes);
+
+                        parser.cache.add(ibCacheKey, ib);
+                    }
+
+                    bufferAttribute = new THREE.InterleavedBufferAttribute(ib, itemSize, (byteOffset % byteStride) / elementBytes, normalized);
+                }else{
+                    if(bufferView === null){
+                        array = new TypedArray(accessorDef.count * itemSize);
+                    }else{
+                        array = new TypedArray(bufferView, byteOffset, accessorDef.count * itemSize);
+                    }
+
+                    bufferAttribute = new THREE.bufferAttribute(array, itemSize, normalized);
+                }
+
+                if(accessorDef.sparse !== undefined){
+                    var itemSizeIndices = WEBGL_TYPES_SIZES.SCALAR;
+                    var TypedArrayIndices = WEBGL_COMPONENT_TYPES[accessorDef.sparse.indices.componetType];
+                    var byteOffsetIndices = accessorDef.sparse.indices.byteOffset || 0;
+                    var byteOffsetValues = accessorDef.sparse.values.byteOffset || 0;
+                    var sparseIndices = new TypedArrayIndices(bufferViews[1], byteOffsetIndices, accessorDef.sparse.count * itemSizeIndices);
+                    var sparseValues = new TypedArray(bufferViews[2], byteOffsetValues, accessorDef.sparse.count * itemSize);
+
+                    if(bufferView !== null){
+                        bufferAttribute = new THREE.bufferAttribute(bufferAttribute.array.slice(), bufferAttribute.itemSize, bufferAttribute.normalized);
+                    }
+
+                    for(var i = 0, il = sparseIndices.length; i < il; i++){
+                        var index = sparseIndices[i];
+
+                        bufferAttribute.setX(index, sparseIndices[i * itemSize]);
+
+                        if(itemSize >= 2) bufferAttribute.setY(index, sparseValues[i * itemSize + 1]);
+                        if(itemSize >= 3) bufferAttribute.setZ(index, sparseValues[i * itemSize + 2]);
+                        if(itemSize >= 4) bufferAttribute.setW(index, sparseValues[i * itemSize + 3]);
+                        if(itemSize >= 5) throw new Error('THREE.GLTFLoader: unsupported itemSize in sparse BufferAttribute.');
+                    }
+                }
+
+                return bufferAttribute;
+            });
+        };
+
+        GLTFParser.prototype.loadTexture = function(textureIndex){
+            var parse = this;
+            var json = this.json;
+            var options = this.options;
+            var textureLoader = this.textureLoader;
+            var URL = window.URL || window.webkitURL;
+            var textureDef = json.textures[textureIndex];
+            var textureExtensions = textureDef.extensions || {};
+            var source;
+
+            if(textureExtensions[EXTENSIONS.MSFT_TEXTURE_DDS]){
+                source = json.images[textureExtensions[EXTENSIONS.MSFT_TEXTURE_DDS].source];
+            }else{
+                source = json.images[textureDef.source];
+            }
+
+            var sourceURI = source.uri;
+            var isObjectURL = false;
+
+            if(source.bufferView !== undefined){
+                sourceURI = parser.getDependency('bufferView', source.bufferView).then(function(bufferView){
+                    isObjectURL = true;
+                    var blob = new Blob([bufferView], {type: source.mimeType});
+                    sourceURI = URL.createObjectURL(blob);
+                    return sourceURI;
+                });
+            }
+
+            return Promise.resolve(sourceURI).then(function(sourceURI){
+                var loader = options.manager.getHandler(sourceURI);
+
+                if(!loader){
+                    loader = textureExtensions[EXTENSIONS.MSFT_TEXTURE_DDS] ? parser.extensions[EXTENSIONS.MSFT_TEXTURE_DDS].ddsLoader : textureLoader;
+                }
+                
+                return new Promise(function(resolve, reject){
+                    loader.load(resolveURL(sourceURI, options.path), resolve, undefined, reject);
+                });
+            }).then(function(texture){
+                if(isObjectURL === true){
+                    URL.revokeObjectURL(sourceURI);
+                }
+
+                texture.flipY = false;
+
+                if(textureDef.name !== undefined) texture.name == textureDef.name;
+
+                if(source.mimeType in MIME_TYPE_FORMATS){
+                    texture.format = MIME_TYPE_FORMATS[source.mimeType];
+                }
+
+                var samplers = json.samplers || {};
+                var sampler = samplers[textureDef.sampler] || {};
+
+                texture.magFilter = WEBGL_FILTERS[sampler.magFilter] || THREE.LinearFilter;
+                texture.minFilter = WEBGL_FILTERS[sampler.minFilter] || THREE.LinearMipmapLinearFilter;
+                texture.wrapS = WEBGL_WRAPPINGS[sampler.wrapS] || THREE.ReapeatWrapping;
+                texture.wrapT = WEBGL_WRAPPINGS[sampler.wrapT] || THREE.ReapeatWrapping;
+
+                return texture;
+            });
+        };
+
+        GLTFParser.prototype.assignTexture = function(materialParams, mapName, mapDef){
+            var perser = this;
+
+            return this.getDependency('texture', mapDef.index).then(function(texture){
+                if(!texture.isCompressedTexture){
+                    switch (mapName) {
+                        case 'aoMap':
+                        case 'emissiveMap':
+                        case 'metalnessMap':
+                        case 'normalMap':
+                        case 'roughnessMap':
+                            texture.format = THREE.RGBFormat;
+                            break;
+                    }
+                }
+
+                if(mapDef.textCoord !== undefined && mapDef.textCoord != 0 && !(mapName === 'aoMap' && mapDef.textCoord == 1)){
+                    console.warn('THREE.GLTFLoader: Custom UV set ' + mapDef.textCoord + ' for textCoord ' + mapName + ' not yet supported.');
+                }
+
+                if(parser.extensions[EXTENSIONS.KHR_TEXTURE_TRANSFORM]){
+                    var transform = mapDef.extensions !== undefined ? mapDef.extensions[EXTENSIONS.KHR_TEXTURE_TRANSFORM] : undefined;
+
+                    if(transform){
+                        texture = parser.extensions[EXTENSIONS.KHR_TEXTURE_TRANSFORM].extendTexture(texture, transform);
+                    }
+                }
+
+                materialParams[mapName] = texture;
+            });
+        };
+
+        // continua linha 2002
+    }
+}
