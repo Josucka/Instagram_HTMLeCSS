@@ -1314,6 +1314,345 @@ function addMorphTargets(geometry, targets, parser){
             });
         };
 
-        // continua linha 2002
+        GLTFParser.prototype.assignFinalMaterial = function(mesh){
+            var geometry = mesh.geometry;
+            var material = mesh.material;
+            var extensions = this.extensions;
+            var useVertexTangents = geometry.attributes.target !== undefined;
+            var useVertexColors = geometry.attributes.color !== undefined;
+            var useFlatShading = geometry.attributes.normal === undefined;
+            var useSkinning = mesh.isSkinnedMesh == true;
+            var useMorphTargets = Object.keys(geometry.morphAttributes).length > 0;
+            var useMorphNormals = useMorphTargets && geometry.morphAttributes.normal !== undefined;
+
+            if(mesh.position){
+                var cacheKey = 'PointsMaterial:' + material.uuid;
+                var PointsMaterial = this.cache.get(cacheKey);
+
+                if(!PointsMaterial){
+                    PointsMaterial = new THREE.PointsMaterial();
+                    THREE.Material.prototype.copy.call(PointsMaterial, material);
+                    PointsMaterial.color.copy(material.color);
+                    PointsMaterial.map = material.map;
+                    PointsMaterial.sizeAttenuation = false;
+
+                    this.cache.add(cacheKey, PointsMaterial);
+                }
+
+                material = PointsMaterial;
+            }else if(mesh.isLine){
+                var cacheKey = 'LineBasicMaterial:' + material.uuid;
+                var lineMaterial = this.cache.get(cacheKey);
+
+                if(!lineMaterial){
+                    lineMaterial = new THREE.LineBasicMaretial();
+                    THREE.Material.prototype.copy.call(lineMaterial, material);
+                    lineMaterial.color.copy(material.color);
+
+                    this.cache.add(cacheKey, lineMaterial);
+                }
+
+                material = lineMaterial;
+            }
+
+            if(useVertexTangents || useVertexColors || useFlatShading || useSkinning || useMorphTargets){
+                var cacheKey = 'ClonedMaterial:' + material.uuid + ':';
+
+                if(material.isGLTFSpecularGlossinessMaterial) cacheKey += 'specular-glossiness:';
+                if(useSkinning) cacheKey += 'skinning';
+                if(useVertexTangents) cacheKey += 'vertex-tangents:';
+                if(useVertexColors) cacheKey += 'vertex-colors';
+                if(useFlatShading) cacheKey += 'flat-shading:';
+                if(useMorphTargets) cacheKey += 'morph-targets:';
+                if(useMorphNormals) cacheKey += 'morph-normals';
+
+                var cachedMaterial = this.cache.get(cacheKey);
+
+                if(!cachedMaterial){
+                    cachedMaterial = material.isGLTFSpecularGlossinessMaterial ? extensions[EXTENSIONS.KHR_MATERIALS_PBR_SPECULAR_GLOSSINESS].cloneMaterial(material) : material.clone();
+
+                    if(useSkinning) cachedMaterial.skinning = true;
+                    if(useVertexTangents) cachedMaterial.vertexTangents = true;
+                    if(useVertexColors) cachedMaterial.vertexColors = THREE.vertexColors;
+                    if(useFlatShading) cachedMaterial.flatShading = true;
+                    if(useMorphTargets) cachedMaterial.morphTargets = true;
+                    if(useMorphNormals) cachedMaterial.morphNormals = true;
+
+                    this.cache.add(cacheKey, cachedMaterial);
+                }
+
+                material = cachedMaterial;
+            }
+
+            if(material.aoMap && geometry.attributes.uv2 === undefined && geometry.attributes.uv !== undefined){
+                geometry.setAttribute('uv2', new THREE.BufferAttribute(geometry.attributes.uv.array, 2));
+            }
+
+            mesh.onBeforeRender = extensions[EXTENSIONS.KHR_MATERIALS_PBR_SPECULAR_GLOSSINESS].refreshUniforms;
+        }
+
+        if(material.normalScale && !useVertexTangents){
+            material.normalScale.y =- material.normalScale.y;
+        }
+
+        mesh.material = material;
+    };
+
+    GLTFParse.prototype.loadMaterial = function (materialIndex){
+        var parser = this;
+        var json = this.json;
+        var extensions = this.extensions;
+        var materialDef = json.materials[materialIndex];
+        var materialType;
+        var materialParams = {};
+        var materialExtensions = materialDef.extensions || {};
+        var pending = [];
+
+        if(materialExtensions[EXTENSIONS.KHR_MATERIALS_PBR_SPECULAR_GLOSSINESS]){
+            var sgExtension = extensions[EXTENSIONS.KHR_MATERIALS_PBR_SPECULAR_GLOSSINESS];
+            materialType = sgExtension.getMaterialType();
+            pending.push(sgExtension.extendParams(materialParams, materialDef, parser));
+        }else if(materialExtensions[EXTENSIONS.KHR_MATERIALS_UNLIT]){
+            var kmuExtension = extensions[EXTENSIONS.KHR_MATERIALS_UNLIT];
+            materialType = kmuExtension.getMaterialType();
+            pending.push(kmuExtension.extendParams(materialParams, materialDef, parser));
+        }else{
+            materialType = THREE.MeshStandardMaterial;
+
+            var metallicRoughness = materialDef.pbrMetallicRoughness || {};
+
+            materialParams.color = new THREE.Color(1.0, 1.0, 1.0);
+            materialParams.opacity = 1.0;
+
+            if(Array.isArray(metallicRoughness.baseColorFactor)){
+                var array = metallicRoughness.baseColorFactor;
+                
+                materialParams.color.fromArray(array);
+                materialParams.opacity = array[3];
+            }
+
+            if(metallicRoughness.baseColorTexture !== undefined){
+                pending.push(parser.assignTexture(materialParams, 'map', metallicRoughness.baseColorTexture));
+            }
+
+            materialParams.metalness = metallicRoughness.metallicFactor !== undefined ? metallicRoughness.metallicFactor : 1.0;
+            materialParams.roughness = metallicRoughness.roughnessFactor !== undefined ? metallicRoughness.roughnessFactor : 1.0;
+
+            if(metallicRoughness.metallicRoughnessTexture !== undefined){
+                pending.push(parser.assignTexture(materialParams, 'metalnessMap', metallicRoughness.metallicRoughnessTexture));
+                pending.push(parser.assignTexture(materialParams, 'roughnessMap', metallicRoughness.metallicRoughnessTexture));
+            }
+        }
+
+        if(materialDef.doubleSided === true){
+            materialParams.side = THREE.DoubleSide;
+        }
+
+        var alphaMode = materialDef.alphaMode || ALPHA_MODES.OPAQUE;
+
+        if(alphaMode === ALPHA_MODES.BLEND){
+            materialParams.transparent = true;
+        }else{
+            materialParams.transparent = false;
+
+            if(alphaMode === ALPHA_MODES.MASK){
+                materialParams.alphaTest = materialDef.alphaCutoff !== undefined ? materialDef.alphaCutoff : 0.5;
+            }
+        }
+
+        if(materialDef.normalTexture !== undefined && materialType !== THREE.MeshBasicMaterial){
+            pending.push(parser.assignTexture(materialParams, 'normalMap', materialDef.normalTexture));
+            materialParams.normalScale = new THREE.Vector2(1, 1);
+
+            if(materialDef.normalTexture.scale !== undefined){
+                materialParams.normalScale.set(materialDef.normalTexture.scale, materialDef.normalTexture.scale);
+            }
+        }
+
+        if(materialDef.occlusionTeture !== undefined &&materialType !==THREE.MeshBasicMaterial){
+            pending.push(parser.assignTexture(materialParams, 'aoMap', materialDef.occlusionTeture));
+
+            if(materialDef.occlusionTeture.strength !== undefined){
+                materialParams.aoMapIntensity = materialDef.occlusionTeture.strength;
+            }
+        }
+
+        if(materialDef.emissiveFactor !== undefined && materialType !== THREE.MeshBasicMaterial){
+            materialParams.emissive = new THREE.Color().fromArray(materialDef.emissiveFactor);
+        }
+
+        if(materialDef.emissiveTexture !== undefined && materialType !== THREE.MeshBasicMaterial){
+            pending.push(parser.assignTexture(materialParams, 'emissiveMap', materialDef.emissiveTexture));
+        }
+
+        return Promise.all(pending).then(function(){
+            var material;
+
+            if(materialType === THREE.ShaderMaterial){
+                material = extensions[EXTENSIONS.KHR_MATERIALS_PBR_SPECULAR_GLOSSINESS].createMaterial(materialParams);
+            }else{
+                material = new materialType(materialParams);
+            }
+
+            if(materialDef.name !== undefined) material.name = materialDef.name;
+            if(material.map) material.map.encoding = THREE.sRGBEncoding;
+            if(material.emissiveMap) material.emissiveMap.encoding = THREE.sRGBEncoding;
+            if(material.specularMap) material.specularMap.encoding = THREE.sRGBEncoding;
+
+            assignExtrasToUserData(material, materialDef);
+
+            if(materialDef.extensions) addUnknownExtendionsToUserData(extensions, material, materialDef);
+
+            return material;
+        });
+    };
+
+    function computeBounds(geometry, primitiveDef, parser) {
+        var attributes = primitiveDef.attributes;
+        var box = new THREE.Box3();
+
+        if(attributes.POSITION !== undefined){
+            var accessor = parser.json.accessors[attributes.POSITION];
+            var min = accessor.min;
+            var max = accessor.max;
+
+            if(min !== undefined && max !== undefined){
+                box.set(
+                    new THREE.Vector3(min[0], min[1], min[2]),
+                    new THREE.Vector3(max[0], max[1], max[2])
+                );
+            }else{
+                console.warn('THREE.GLTFLoader: Missing min/max properties for accessor POSITION.');
+
+                return;
+            }
+        }else{
+            return;
+        }
+
+        var targets = primitiveDef.targets;
+
+        if(targets !== undefined){
+            var vector = new THREE.Vector3();
+
+            for(var i = 0, il = targets.length; i < il; i++){
+                var tangent = targets[i];
+
+                if(target.POSITION !== undefined){
+                    var accessor = parser.json.accessors[target.POSITION];
+                    var min = accessor.min;
+                    var max = accessor.max;
+
+                    if(min !== undefined && max !== undefined){
+                        vector.setX(Math.max(Math.abs(min[0]), Math.abs(max[0])));
+                        vector.setY(Math.max(Math.abs(min[1]), Math.abs(max[1])));
+                        vector.setZ(Math.max(Math.abs(min[2]), Math.abs(max[2])));
+
+                        box.extendByVector(vector);
+                    }else{
+                        console.warn('THREE.GLTFLoader: Missing min/max properties for accessor POSITION.');
+                    }
+                }
+            }
+        }
+
+        geometry.boudingBox = box;
+
+        var sphere = new THREE.Sphere();
+
+        box.getCenter(sphere.center);
+        sphere.radius = box.min.distanceTo(box.max) / 2;
+        geometry.boundingSphere = sphere;
     }
+
+    function addPrimiticeAttributes(geometry, primitiveDef, parser) {
+        
+        var attributes = primitiveDef.attributes;
+        var pending = [];
+
+        function assignAttributeAccessor(accessorIndex, attributeName) {
+            return parser.getDependency('accessor', accessorIndex).then(function(accessor){
+                geometry.setAttribute(attributeName, accessor);
+            });
+        }
+
+        for(var gltfAttributeName in attributes){
+            var threeAttrinuteName = ATTRIBUTES[gltfAttributeName] || gltfAttributeName.toLowerCase();
+
+            if(threeAttrinuteName in geometry.attributes) continue;
+
+            pending.push(assignAttributeAccessor(attributes[gltfAttributeName], threeAttrinuteName));
+        }
+
+        if(primitiveDef.indices !== undefined && !geometry.index){
+            var accessor = parser.getDependency('accessor', primitiveDef.indices).then(function (accessor) {
+                geometry.push(accessor);
+            });
+            pending.push(accessor);
+        }
+
+        assignExtrasToUserData(geometry, primitiveDef);
+        computeBounds(geometry, primitiveDef, parser);
+
+        return Promise.all(pending).then(function () {
+            return primitiveDef.targets !== undefined ? addMorphTargets(geometry, primitiveDef.targets, parser) : geometry;
+        });
+    }
+
+    function toTrianglesDrawMode(geometry, drawMode) {
+        var index = geometry.getIndex();
+
+        if(index === null){
+            var indices = [];
+            var position = geometry.getAttribute('position');
+
+            if(position !== undefined){
+                for(var i = 0; i < position.count; i++){
+                    indices.push(i);
+                }
+
+                geometry.setIndex(indices);
+                index = geometry.getIndex();
+            }else{
+                console.warn('THREE.GLTFLoader.toTrianglesDrawMode(): Undefined position attribute. Processing not possible.');
+
+                return geometry;
+            }
+        }
+
+        var numberOfTriangles = index.count - 2;
+        var newIndices = [];
+
+        if(drawMode === THREE.TrianglesFanDrawMode){
+            for(var i = 1; i <= numberOfTriangles; i++){
+                newIndices.push(index.getX(0));
+                newIndices.push(index.getX(i));
+                newIndices.push(index.getX(i + 1));
+            }
+        }else{
+            for(var i = 0; i < numberOfTriangles; i++){
+                if(i % 2 === 0){
+                    newIndices.push(index.getX(0));
+                    newIndices.push(index.getX(i));
+                    newIndices.push(index.getX(i + 1));
+                }else{
+                    newIndices.push(index.getX(i + 2));
+                    newIndices.push(index.getX(i + 1));
+                    newIndices.push(index.getX(i));
+                }
+            }
+        }
+
+        if((newIndices.length / 3) !== numberOfTriangles){
+            console.warn('THREE.GLTFLoader.toTrianglesDrawMode(): Unable to generate correct amount of triangles.');
+        }
+
+        var newGeometry = geometry.clone();
+        newGeometry.setIndex(newIndices);
+
+        return newGeometry;
+    }
+
+    //ta acabando line 2531
+
 }
